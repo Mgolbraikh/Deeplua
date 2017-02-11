@@ -1,0 +1,190 @@
+require 'nn'
+require 'image'
+require 'optim'
+
+logger = optim.Logger('Transfer.log') -- logger can be changed  
+logger:setNames{'Trainset Error', 'Testset Error'}
+
+function train(numClasses, earlyStop)
+
+	dataset = torch.load('../flowers.t7')
+	classes = torch.range(1,numClasses):totable() --4 classes (from 1 to 4 by step of 1)
+	labels  = torch.range(1,numClasses):view(numClasses,1):expand(numClasses,80) -- Making array from 1 to 17 and each cell in size of 80
+	
+	dataset = nn.Narrow(1, 1, numClasses):forward(dataset) -- Shrinking the dataset to numClasses size
+
+	print(dataset:size()) --each class has 80 images of 3x128x128
+
+	function shuffle(data,ydata) --shuffle data function
+	    local RandOrder = torch.randperm(data:size(1)):long()
+	    return data:index(1,RandOrder), ydata:index(1,RandOrder)
+	end
+
+	shuffledData, shuffledLabels = shuffle(dataset:view(-1,3,128,128), labels:contiguous():view(-1))
+
+	trainSize = 0.85 * shuffledData:size(1)
+	trainData, testData = unpack(shuffledData:split(trainSize, 1))
+	trainLabels, testLabels = unpack(shuffledLabels:split(trainSize, 1))
+
+	print(trainData:size())
+
+	trainData = trainData:float() -- convert the data from a ByteTensor to a float Tensor.
+	trainLabels = trainLabels:float()
+
+	-- Normalizing the data in order to make the features comparable (data numbers are between -1 and 1)
+	mean, std = trainData:mean(), trainData:std()
+	print(mean, std)
+	trainData:add(-mean):div(std)
+	    
+	testData = testData:float()
+	testLabels = testLabels:float()
+	mean, std = testData:mean(), testData:std()
+	testData:add(-mean):div(std)
+
+	-- Load GoogLeNet
+	googLeNet = torch.load('../GoogLeNet_v2_nn.t7')
+
+	-- The new network
+	model = nn.Sequential()
+
+	for i=1,10 do
+	    local layer = googLeNet:get(i):clone()
+	    layer.parameters = function() return {} end --disable parameters
+	    layer.accGradParamters = nil --remove accGradParamters
+	    model:add(layer)
+	end
+
+	-- Add the new layers
+	-- google feature maps are 320*16*16
+	model:add(nn.SpatialConvolution(320, 16, 3, 3)) -- Default values are Stride=1 and no padding (the fifth parameter which is not entered and we didn't padd)
+	-- the feature maps are 16*14*14
+	model:add(nn.ReLU())                         -- ReLU non-linearity
+	model:add(nn.SpatialMaxPooling(4,4,4,4))     -- A max-pooling operation that looks at 4x4 windows and finds the max. (X,Y, X padding size, Y padding size)
+	-- the feature maps are 16*3.5*3.5 (3.5 cells are taken as 3 cells)
+	model:add(nn.View(16*3*3)) -- reshapes 
+	model:add(nn.Dropout(0.5)) -- Droput in probabality of 50%
+	model:add(nn.Linear(16*3*3, numClasses)) -- numClasses is the number of outputs of the network
+	model:add(nn.LogSoftMax()) -- converts the output to probability
+	model:float()
+
+	--print(tostring(model))
+
+	-- Check output dimensions with random input
+	--model:float()
+	--local y = model:forward(torch.rand(32,3,128,128):float())
+	--print(y:size()) -- 1*320*16*16
+
+	-- Loss Function = Negative Log Likelihood ()
+	lossFunc = nn.ClassNLLCriterion():float() 
+	w, dE_dw = model:getParameters()
+
+	--print('Number of parameters:', w:nElement())
+
+	batchSize = 32
+	epochs = 200
+	optimState = {
+	    learningRate = 0.085
+	}
+
+	function forwardNet(data, labels, train)
+	    --another helpful function of optim is ConfusionMatrix
+	    local confusion = optim.ConfusionMatrix(torch.range(1,numClasses):totable())
+	    local lossAcc = 0
+	    local numBatches = 0
+	    if train then
+	        --set network into training mode
+	        model:training()
+	    end
+
+	    numBatches = numBatches + 1
+
+	    -- Taking data+labels at the size of batchSize (the data is already shuffled)
+        local x = data:narrow(1, 1, batchSize):float()
+        -- data size in training is 272*3*128*128 (272 = 320 * 0.85)
+        -- X size is     32*3*128*128
+        -- label size is 272
+        local yt = labels:narrow(1, 1, batchSize):float()
+        -- yt size is    32
+        local y = model:forward(x)
+        local err = lossFunc:forward(y, yt)
+        lossAcc = lossAcc + err
+        confusion:batchAdd(y,yt)
+        
+        if train then
+            function feval()
+                model:zeroGradParameters() --zero grads
+                local dE_dy = lossFunc:backward(y,yt)
+                model:backward(x, dE_dy) -- backpropagation
+            
+                return err, dE_dw
+            end
+            
+            --optim.adagrad(feval, w, optimState)
+            --optim.sgd(feval, w, optimState)
+            optim.adam(feval, w, optimState)
+        end
+	    
+	    confusion:updateValids()
+	    local avgLoss = lossAcc / numBatches
+	    local avgError = 1 - confusion.totalValid
+	    
+	    return avgLoss, avgError, tostring(confusion)
+	end -- End of forwardNet
+
+	trainLoss = torch.Tensor(epochs)
+	testLoss = torch.Tensor(epochs)
+	trainError = torch.Tensor(epochs)
+	testError = torch.Tensor(epochs)
+
+	--reset net weights
+	model:apply(function(l) l:reset() end)
+
+	for e = 1, epochs do
+	    trainData, trainLabels = shuffle(trainData, trainLabels) --shuffle training data
+	    trainLoss[e], trainError[e] = forwardNet(trainData, trainLabels, true)
+	    testLoss[e], testError[e], confusionM = forwardNet(testData, testLabels, false)
+	    logger:add{trainError[e],testError[e]} -- loss is the value which you want to plot
+	    logger:style{'-','-'}   -- the style of your line, as in MATLAB, we use '-' or '|' etc.
+
+	    print('Epoch ' .. e .. ':')
+        print('Training error: ' .. trainError[e], 'Training Loss: ' .. trainLoss[e])
+        print('Test error: ' .. testError[e], 'Test Loss: ' .. testLoss[e])
+        print(confusionM)
+
+        if testError[e] <= earlyStop then
+        	break
+        end
+	end -- end epochs
+
+	function showImagesProbablity()
+		-- the confusion matrix
+		local confusion = optim.ConfusionMatrix(torch.range(1,numClasses):totable())
+		-- Taking the first 10 pics (without floating)
+		local pics = trainData:narrow(1, 1, 10)
+		-- Taking the label of the first 10 pics
+		local picsLabels = trainLabels:narrow(1, 1, 10):float()
+
+		image.display(pics)
+
+		-- Testing the first 10 pics (therefore floating)
+		local y = model:forward(pics:float())
+		-- Printing the probablity of all pics
+		print(y)
+		-- Printing the real values of each pic
+		print(picsLabels)
+		-- Inserting data to the confusion matrix
+		confusion:batchAdd(y,picsLabels)
+		confusion:updateValids()
+
+	    local avgError = 1 - confusion.totalValid
+		print('Average error of pics:' .. avgError)
+	end
+
+	--showImagesProbablity()
+end
+
+local NumClasses=4
+local EarlyStop=0.1
+train(NumClasses, EarlyStop)
+
+logger:plot()
